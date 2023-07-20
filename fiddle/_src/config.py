@@ -26,7 +26,7 @@ import inspect
 import itertools
 import logging
 import types
-from typing import Any, Callable, Collection, Dict, FrozenSet, Generic, Iterable, Mapping, NamedTuple, Optional, Set, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Collection, Dict, FrozenSet, Generic, Iterable, List, Mapping, NamedTuple, Optional, Set, Tuple, Type, TypeVar, Union
 
 from fiddle._src import arg_factory
 from fiddle._src import daglish
@@ -223,6 +223,8 @@ class Buildable(Generic[T], metaclass=abc.ABCMeta):
   __arguments__: Dict[str, Any]
   __argument_history__: history.History
   __argument_tags__: Dict[str, Set[tag_type.TagType]]
+  __positional_arg_names__: List[str]
+  __has_var_positional__: bool
   _has_var_keyword: bool
 
   def __init__(
@@ -245,19 +247,23 @@ class Buildable(Generic[T], metaclass=abc.ABCMeta):
     super().__setattr__('__argument_history__', arg_history)
     super().__setattr__('__argument_tags__', collections.defaultdict(set))
 
+    positional_arguments = ()
     arguments = signature.bind_partial(*args, **kwargs).arguments
     for name in list(arguments.keys()):  # Make a copy in case we mutate.
       param = signature.parameters[name]
       if param.kind == param.VAR_POSITIONAL:
-        # TODO(b/197367863): Add *args support.
-        err_msg = (
-            'Variable positional arguments (aka `*args`) not supported. '
-            f'Found param `{name}` in `{fn_or_cls}`.'
-        )
-        raise NotImplementedError(err_msg)
+        positional_arguments = arguments.pop(param.name)
       elif param.kind == param.VAR_KEYWORD:
         arguments.update(arguments.pop(param.name))
 
+    if positional_arguments:
+      self.__arguments__['__args__'] = list(positional_arguments)
+      self.__argument_history__.add_new_value(
+          '__args__', self.__arguments__['__args__']
+      )
+
+    for i, value in enumerate(positional_arguments):
+      self[i] = value
     for name, value in arguments.items():
       setattr(self, name, value)
 
@@ -286,10 +292,25 @@ class Buildable(Generic[T], metaclass=abc.ABCMeta):
     super().__setattr__('__arguments__', {})
     signature = signatures.get_signature(fn_or_cls)
     super().__setattr__('__signature__', signature)
-    has_var_keyword = any(
-        param.kind == param.VAR_KEYWORD
-        for param in signature.parameters.values()
-    )
+
+    # If *args exists, we must pass things before it in positional format. This
+    # list tracks those arguments.
+    maybe_positional_args = []
+
+    positional_only_args = []
+    has_var_positional, has_var_keyword = False, False
+    for param in signature.parameters.values():
+      if param.kind == param.VAR_POSITIONAL:
+        has_var_positional = True
+        positional_only_args.extend(maybe_positional_args)
+      elif param.kind == param.VAR_KEYWORD:
+        has_var_keyword = True
+      elif param.kind == param.POSITIONAL_ONLY:
+        positional_only_args.append(param.name)
+      elif param.kind == param.POSITIONAL_OR_KEYWORD:
+        maybe_positional_args.append(param.name)
+    super().__setattr__('__positional_arg_names__', positional_only_args)
+    super().__setattr__('__has_var_positional__', has_var_positional)
     super().__setattr__('_has_var_keyword', has_var_keyword)
     return signature
 
@@ -326,6 +347,14 @@ class Buildable(Generic[T], metaclass=abc.ABCMeta):
 
   def __getattr__(self, name: str):
     """Get parameter with given ``name``."""
+    if name == 'posargs':
+      if not self.__has_var_positional__:
+        raise TypeError(
+            "This function doesn't have variadic positional arguments (*args). "
+            'Please set other (including positional-only) arguments by name.'
+        )
+
+      name = '__args__'
     value = self.__arguments__.get(name, _UNSET_SENTINEL)
 
     if value is not _UNSET_SENTINEL:
@@ -386,6 +415,34 @@ class Buildable(Generic[T], metaclass=abc.ABCMeta):
             f"{', '.join(valid_parameter_names)}."
         )
       raise TypeError(err_msg)
+
+  def __setitem__(self, key: Any, value: Any):
+    if not isinstance(key, (int, slice)):
+      raise TypeError(
+          'Setting arguments by index is only supported for variadic '
+          "arguments (*args), like my_config[4] = 'foo'."
+      )
+    if not self.__has_var_positional__:
+      raise TypeError(
+          "This function doesn't have variadic positional arguments (*args). "
+          'Please set other (including positional-only) arguments by name.'
+      )
+
+    # In the future, use a specialized history-tracking list.
+    if '__args__' not in self.__arguments__:
+      self.__arguments__['__args__'] = []
+      self.__argument_history__.add_new_value('__args__', [])
+    args = self.__arguments__['__args__']
+    args[key] = value
+
+  def __getitem__(self, key: Any):
+    if not isinstance(key, slice):
+      raise TypeError(
+          'Getting arguments by index is only supported when using slice, '
+          'for example `v = my_config[:2]`, or using the `posargs` attr '
+          f'instead, like v = my_config[0]. Got {type(key)} type as key.'
+      )
+    return self.posargs[key]
 
   def __setattr__(self, name: str, value: Any):
     """Sets parameter ``name`` to ``value``."""
@@ -950,13 +1007,63 @@ def update_callable(
   # will result in duplicate history entries.
   original_args = buildable.__arguments__
   signature = signatures.get_signature(new_callable)
+  # Update the signature early so that we can set arguments by position
+  object.__setattr__(buildable, '__signature__', signature)
+
   if any(
       param.kind == param.VAR_POSITIONAL
       for param in signature.parameters.values()
   ):
-    raise NotImplementedError(
-        'Variable positional arguments (aka `*args`) not supported.'
-    )
+    # Both callables have *args
+    if buildable.__has_var_positional__:
+      args_ptr = -1
+      consumed_args = 0
+      for idx, arg in enumerate(signature.parameters.keys()):
+        if arg not in original_args.keys():
+          args_ptr = idx
+          break
+      all_args_key = list(signature.parameters.keys())
+      while args_ptr < len(all_args_key):
+        key = all_args_key[args_ptr]
+        param = signature.parameters[key]
+        if param.kind == param.VAR_POSITIONAL:
+          break
+        else:
+          value = original_args['__args__'][args_ptr]
+          buildable.__setattr__(key, value)
+          args_ptr += 1
+        consumed_args += 1
+
+      buildable.__arguments__['__args__'] = buildable.__arguments__['__args__'][
+          consumed_args:
+      ]
+    # Only new callable has *args
+    else:
+      object.__setattr__(buildable, '__args__', [])
+      buildable.__argument_history__.add_new_value('__args__', [])
+  else:
+    # If only the original config has *args
+    if buildable.__has_var_positional__:
+      args_start_at = -1
+      for idx, arg in enumerate(signature.parameters.keys()):
+        if arg not in original_args.keys():
+          args_start_at = idx
+          break
+
+      if len(signature.parameters) < args_start_at + len(
+          original_args['__args__']
+      ):
+        if not drop_invalid_args:
+          raise ValueError(
+              'new_callable does not have enough arguments when unpack *args: '
+              f'{original_args["__args__"]} from the original buildable.'
+          )
+      arg_keys = list(signature.parameters.keys())[args_start_at:]
+      for arg, value in zip(arg_keys, original_args['__args__']):
+        buildable.__setattr__(arg, value)
+      del buildable.__args__
+      object.__setattr__(buildable, '__has_var_positional__', False)
+
   has_var_keyword = any(
       param.kind == param.VAR_KEYWORD for param in signature.parameters.values()
   )
@@ -976,7 +1083,6 @@ def update_callable(
         )
 
   object.__setattr__(buildable, '__fn_or_cls__', new_callable)
-  object.__setattr__(buildable, '__signature__', signature)
   object.__setattr__(buildable, '_has_var_keyword', has_var_keyword)
   buildable.__argument_history__.add_new_value('__fn_or_cls__', new_callable)
 
